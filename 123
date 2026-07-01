@@ -95,8 +95,16 @@ local function snapshotConfig(registry)
 	return data
 end
 
+local SAVE_MODE_FILE = "sparestack_savemode.txt"
+local saveMode = "auto"
+do
+	local ok, raw = pcall(readfile, SAVE_MODE_FILE)
+	if ok and raw and (raw == "auto" or raw == "manual") then saveMode = raw end
+end
+
 local saveScheduled = false
 local function saveConfig()
+	if saveMode ~= "auto" then return end
 	if saveScheduled then return end
 	saveScheduled = true
 	task.delay(0.25, function()
@@ -104,6 +112,15 @@ local function saveConfig()
 		local data = snapshotConfig(configRegistry)
 		pcall(writefile, CONFIG_KEY .. ".json", HttpService:JSONEncode(data))
 	end)
+end
+
+local function forceSaveConfig()
+	local data = snapshotConfig(configRegistry)
+	pcall(writefile, CONFIG_KEY .. ".json", HttpService:JSONEncode(data))
+end
+
+local function persistSaveMode()
+	pcall(writefile, SAVE_MODE_FILE, saveMode)
 end
 
 local function loadConfig()
@@ -301,6 +318,27 @@ onPointerMove(function(x, y)
 	if not tooltipFrame.Visible then return end
 	tooltipFrame.Position = UDim2.new(0, x + 14, 0, y + 16)
 end)
+
+local activePopupClosers = {}
+
+local function registerPopup(closeFn)
+	table.insert(activePopupClosers, closeFn)
+	return function()
+		for i, f in ipairs(activePopupClosers) do
+			if f == closeFn then
+				table.remove(activePopupClosers, i)
+				break
+			end
+		end
+	end
+end
+
+local function closeAllPopups()
+	local snapshot = {}
+	for i, f in ipairs(activePopupClosers) do snapshot[i] = f end
+	activePopupClosers = {}
+	for _, f in ipairs(snapshot) do pcall(f) end
+end
 
 local notifEnabled  = true
 local notifCount    = 0
@@ -692,10 +730,15 @@ local function makeScrollPage(yStart)
 	layout.Padding   = UDim.new(0, 8)
 	layout.Parent    = scroll
 
+	scroll:GetPropertyChangedSignal("CanvasPosition"):Connect(closeAllPopups)
+
 	return clip, scroll
 end
 
+searchResultsScroll:GetPropertyChangedSignal("CanvasPosition"):Connect(closeAllPopups)
+
 local function setTab(name, navEntry)
+	closeAllPopups()
 	navEntry = navEntry or activeNavBtn
 	if not navEntry or not navEntry.tabDefs then return end
 	navEntry.activeTab = name
@@ -713,6 +756,7 @@ local function setTab(name, navEntry)
 end
 
 local function setActiveNav(entry)
+	closeAllPopups()
 	if activeNavBtn then
 		tween(activeNavBtn.btn, { BackgroundColor3 = theme.BG_SIDEBAR })
 		activeNavBtn.btn.BackgroundTransparency = 1
@@ -1015,12 +1059,15 @@ local function buildDropdown(parent, options, default, configKey)
 		listClip.Position = UDim2.new(0, ap.X - fp.X, 0, ap.Y - fp.Y + 38)
 	end
 
+	local unregister
+
 	local function closeList()
 		open = false
 		tween(listClip, { Size = UDim2.new(0, W_WIDE, 0, 0) })
 		tween(chevron,  { Rotation = 0 }, TI_NORM)
 		tween(frame,    { BackgroundColor3 = theme.BG_INPUT }, TI_FAST)
 		if trackConn then trackConn:Disconnect(); trackConn = nil end
+		if unregister then unregister(); unregister = nil end
 	end
 
 	local function setValue(v, silent)
@@ -1082,6 +1129,7 @@ local function buildDropdown(parent, options, default, configKey)
 					if trackConn then trackConn:Disconnect(); trackConn = nil end
 				end
 			end)
+			unregister = registerPopup(closeList)
 		else
 			closeList()
 		end
@@ -1535,20 +1583,31 @@ local function buildColorPicker(parent, defaultColor, configKey)
 		popup.Position = UDim2.new(0, ap.X - fp.X - POPUP_W + 34, 0, belowY)
 	end
 
+	local unregister
+
+	local function closePopup()
+		open = false
+		popup.Visible = false
+		tween(parent, { BackgroundColor3 = theme.BG_ROW }, TI_FAST)
+		if trackConn then trackConn:Disconnect(); trackConn = nil end
+		if unregister then unregister(); unregister = nil end
+	end
+
 	swatchBtn.MouseButton1Click:Connect(function()
 		open = not open
-		positionPopup()
-		popup.Visible = open
-		tween(parent, { BackgroundColor3 = open and Color3.fromRGB(18,17,26) or theme.BG_ROW }, TI_FAST)
 		if open then
+			positionPopup()
+			popup.Visible = true
+			tween(parent, { BackgroundColor3 = Color3.fromRGB(18,17,26) }, TI_FAST)
 			trackConn = RunService.RenderStepped:Connect(function()
 				positionPopup()
 				if not swatch or not swatch.Parent then
 					if trackConn then trackConn:Disconnect(); trackConn = nil end
 				end
 			end)
+			unregister = registerPopup(closePopup)
 		else
-			if trackConn then trackConn:Disconnect(); trackConn = nil end
+			closePopup()
 		end
 	end)
 
@@ -1564,10 +1623,7 @@ local function buildColorPicker(parent, defaultColor, configKey)
 					and mp.Y >= swatch.AbsolutePosition.Y
 					and mp.Y <= swatch.AbsolutePosition.Y + swatch.AbsoluteSize.Y
 				if not (mp.X >= ap.X and mp.X <= ap.X+as.X and mp.Y >= ap.Y and mp.Y <= ap.Y+as.Y) and not onSwatch then
-					open = false
-					popup.Visible = false
-					tween(parent, { BackgroundColor3 = theme.BG_ROW }, TI_FAST)
-					if trackConn then trackConn:Disconnect(); trackConn = nil end
+					closePopup()
 				end
 			end)
 		end
@@ -1749,6 +1805,17 @@ local function buildMultiSelect(parent, options, defaults, configKey)
 		end)
 	end
 
+	local unregister
+
+	local function closeList()
+		open = false
+		tween(listClip, { Size = UDim2.new(0, W_WIDE, 0, 0) })
+		tween(chevron,  { Rotation = 0 }, TI_NORM)
+		tween(frame,    { BackgroundColor3 = theme.BG_INPUT }, TI_FAST)
+		if trackConn then trackConn:Disconnect(); trackConn = nil end
+		if unregister then unregister(); unregister = nil end
+	end
+
 	clickBtn.MouseButton1Click:Connect(function()
 		open = not open
 		if open then
@@ -1762,11 +1829,9 @@ local function buildMultiSelect(parent, options, defaults, configKey)
 					if trackConn then trackConn:Disconnect(); trackConn = nil end
 				end
 			end)
+			unregister = registerPopup(closeList)
 		else
-			tween(listClip, { Size = UDim2.new(0, W_WIDE, 0, 0) })
-			tween(chevron,  { Rotation = 0 }, TI_NORM)
-			tween(frame,    { BackgroundColor3 = theme.BG_INPUT }, TI_FAST)
-			if trackConn then trackConn:Disconnect(); trackConn = nil end
+			closeList()
 		end
 	end)
 
@@ -1974,11 +2039,14 @@ local function buildBind(parent, defaultOn, defaultKey, defaultMode, configKey)
 		popup.Position = UDim2.new(0, x, 0, y)
 	end
 
+	local unregisterBind
+
 	local function closePopup()
 		popupOpen = false
 		popup.Visible = false
 		tween(gearBtn, { ImageColor3 = theme.TEXT_MUTED }, TI_FAST)
 		if trackConn then trackConn:Disconnect(); trackConn = nil end
+		if unregisterBind then unregisterBind(); unregisterBind = nil end
 	end
 
 	gearBtn.MouseButton1Click:Connect(function()
@@ -1993,6 +2061,7 @@ local function buildBind(parent, defaultOn, defaultKey, defaultMode, configKey)
 					if trackConn then trackConn:Disconnect(); trackConn = nil end
 				end
 			end)
+			unregisterBind = registerPopup(closePopup)
 		else
 			closePopup()
 		end
@@ -2628,6 +2697,20 @@ function Lib:SetNotifEnabled(b) notifEnabled = b end
 function Lib:SetNotifPosition(p) notifPosition = p; updateNotifPosition() end
 function Lib:Toggle()           MainFrame.Visible = not MainFrame.Visible end
 function Lib:SetVisible(b)      MainFrame.Visible = b end
+
+function Lib:GetSaveMode() return saveMode end
+
+function Lib:SetSaveMode(mode)
+	if mode ~= "auto" and mode ~= "manual" then return end
+	local wasManual = saveMode == "manual"
+	saveMode = mode
+	persistSaveMode()
+	if wasManual and mode == "auto" then
+		forceSaveConfig()
+	end
+end
+
+function Lib:ForceSave() forceSaveConfig() end
 
 function Lib:SetAccent(color)
 	if typeof(color) ~= "Color3" then return end
